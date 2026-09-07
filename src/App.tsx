@@ -35,7 +35,14 @@ type Photo = {
   location: string
   fileName: string
   kind: 'RAW' | 'JPG'
+  rawBytes?: Uint8Array
+  cameraMake?: string
+  cameraModel?: string
+  profile?: string
 }
+
+type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony'
+type RawDecodeResponse = { png: number[]; camera_make: string; camera_model: string; profile: string }
 
 type Adjustments = {
   exposure: number
@@ -76,6 +83,7 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [importError, setImportError] = useState('')
   const [importStatus, setImportStatus] = useState('')
+  const [cameraProfile, setCameraProfile] = useState<CameraProfileKey>('auto')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoUrls = useRef<string[]>([])
   const selectedPhoto = photos[activePhoto]
@@ -86,7 +94,7 @@ function App() {
     setImportError('')
     const candidates = files.filter((file) => {
       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
-      const isRaw = ['cr1', 'cr2', 'cr3', 'crw'].includes(extension)
+      const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       return isRaw || file.type.startsWith('image/')
     })
     let importedCount = 0
@@ -94,13 +102,16 @@ function App() {
     setImportStatus(candidates.length > 1 ? `Importing 0 of ${candidates.length} photos...` : '')
     for (const file of candidates) {
       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
-      const isRaw = ['cr1', 'cr2', 'cr3', 'crw'].includes(extension)
+      const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       try {
         let src: string
+        let rawBytes: Uint8Array | undefined
+        let rawDetails: Omit<RawDecodeResponse, 'png'> | undefined
         if (isRaw) {
-          const bytes = Array.from(new Uint8Array(await file.arrayBuffer()))
-          const decoded = await invoke<number[]>('decode_raw', { bytes })
-          src = URL.createObjectURL(new Blob([new Uint8Array(decoded)], { type: 'image/png' }))
+          rawBytes = new Uint8Array(await file.arrayBuffer())
+          const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: Array.from(rawBytes), profile: cameraProfile })
+          rawDetails = decoded
+          src = URL.createObjectURL(new Blob([new Uint8Array(decoded.png)], { type: 'image/png' }))
         } else {
           src = URL.createObjectURL(file)
         }
@@ -108,9 +119,13 @@ function App() {
         const importedPhoto: Photo = {
           src,
           title: file.name.replace(/\.[^/.]+$/, ''),
-          location: isRaw ? 'Canon RAW import' : 'Imported photo',
+          location: isRaw ? `${rawDetails?.camera_make ?? 'Camera'} RAW import` : 'Imported photo',
           fileName: file.name,
           kind: isRaw ? 'RAW' : 'JPG',
+          rawBytes,
+          cameraMake: rawDetails?.camera_make,
+          cameraModel: rawDetails?.camera_model,
+          profile: rawDetails?.profile,
         }
         setPhotos((current) => [...current, importedPhoto])
         setActivePhoto((current) => current === 0 && importedCount === 0 ? 0 : current)
@@ -126,6 +141,25 @@ function App() {
     setImportStatus('')
     if (importedCount === 0) return
     setView('library')
+  }
+
+  const changeCameraProfile = async (nextProfile: CameraProfileKey) => {
+    setCameraProfile(nextProfile)
+    if (!selectedPhoto?.rawBytes) return
+    setImportError('')
+    setImportStatus(`Applying ${nextProfile === 'auto' ? 'camera' : nextProfile} profile...`)
+    try {
+      const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: Array.from(selectedPhoto.rawBytes), profile: nextProfile })
+      const src = URL.createObjectURL(new Blob([new Uint8Array(decoded.png)], { type: 'image/png' }))
+      photoUrls.current.push(src)
+      setPhotos((current) => current.map((photo, index) => index === activePhoto ? { ...photo, src, cameraMake: decoded.camera_make, cameraModel: decoded.camera_model, profile: decoded.profile } : photo))
+      URL.revokeObjectURL(selectedPhoto.src)
+      photoUrls.current = photoUrls.current.filter((url) => url !== selectedPhoto.src)
+    } catch (error) {
+      setImportError(`Could not apply camera profile: ${String(error)}`)
+    } finally {
+      setImportStatus('')
+    }
   }
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -195,7 +229,7 @@ function App() {
           <div className={`develop-canvas crop-${crop}`}><img style={{ filter: showBefore ? 'none' : previewFilter, transform: `scale(${zoom}) rotate(${rotation}deg)` }} src={selectedPhoto.src} alt={selectedPhoto.title} /><div className="vignette-overlay" style={{ opacity: Math.max(0, adjustments.vignette) / 140 }} /><div className="canvas-badge">{showBefore ? 'Before' : 'Live preview'}</div></div>
           <div className="filmstrip"><button className="film-import" onClick={() => fileInputRef.current?.click()}><ImagePlus size={18} /><span>Import</span></button>{photos.map((photo, index) => <button className={`film-thumb ${activePhoto === index ? 'active' : ''}`} key={`${photo.fileName}-film-${index}`} onClick={() => { setActivePhoto(index); setShowBefore(false) }}><img src={photo.src} alt={photo.title} /><span>{index + 1}</span></button>)}</div>
         </section>
-        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
+        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
       </main>
     )
   }
