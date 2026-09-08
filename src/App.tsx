@@ -42,7 +42,17 @@ type Photo = {
 }
 
 type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony'
-type RawDecodeResponse = { png: number[]; camera_make: string; camera_model: string; profile: string }
+type RawDecodeResponse = { png: string; camera_make: string; camera_model: string; profile: string }
+
+// Decodes the base64 PNG the Rust side now returns. Base64 (a single
+// string) is far cheaper to send over Tauri's IPC bridge than the previous
+// `Vec<u8>`, which serialized as a JSON array with one element per byte.
+function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
 
 type Adjustments = {
   exposure: number
@@ -109,9 +119,13 @@ function App() {
         let rawDetails: Omit<RawDecodeResponse, 'png'> | undefined
         if (isRaw) {
           rawBytes = new Uint8Array(await file.arrayBuffer())
-          const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: Array.from(rawBytes), profile: cameraProfile })
+          // Pass the Uint8Array itself (not Array.from(rawBytes)) so Tauri
+          // sends it over the fast binary IPC path instead of JSON-encoding
+          // every byte as a separate array element — that conversion was
+          // the main cause of the import lag on larger RAW files.
+          const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: rawBytes, profile: cameraProfile })
           rawDetails = decoded
-          src = URL.createObjectURL(new Blob([new Uint8Array(decoded.png)], { type: 'image/png' }))
+          src = URL.createObjectURL(new Blob([base64ToBytes(decoded.png)], { type: 'image/png' }))
         } else {
           src = URL.createObjectURL(file)
         }
@@ -149,8 +163,8 @@ function App() {
     setImportError('')
     setImportStatus(`Applying ${nextProfile === 'auto' ? 'camera' : nextProfile} profile...`)
     try {
-      const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: Array.from(selectedPhoto.rawBytes), profile: nextProfile })
-      const src = URL.createObjectURL(new Blob([new Uint8Array(decoded.png)], { type: 'image/png' }))
+      const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: selectedPhoto.rawBytes, profile: nextProfile })
+      const src = URL.createObjectURL(new Blob([base64ToBytes(decoded.png)], { type: 'image/png' }))
       photoUrls.current.push(src)
       setPhotos((current) => current.map((photo, index) => index === activePhoto ? { ...photo, src, cameraMake: decoded.camera_make, cameraModel: decoded.camera_model, profile: decoded.profile } : photo))
       URL.revokeObjectURL(selectedPhoto.src)
