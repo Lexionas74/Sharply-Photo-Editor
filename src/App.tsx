@@ -43,10 +43,8 @@ type Photo = {
 
 type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony'
 type RawDecodeResponse = { png: string; camera_make: string; camera_model: string; profile: string }
+type ImportProgress = { completed: number; total: number; fileName: string }
 
-// Decodes the base64 PNG the Rust side now returns. Base64 (a single
-// string) is far cheaper to send over Tauri's IPC bridge than the previous
-// `Vec<u8>`, which serialized as a JSON array with one element per byte.
 function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
@@ -93,6 +91,7 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [importError, setImportError] = useState('')
   const [importStatus, setImportStatus] = useState('')
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null)
   const [cameraProfile, setCameraProfile] = useState<CameraProfileKey>('auto')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoUrls = useRef<string[]>([])
@@ -107,10 +106,13 @@ function App() {
       const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       return isRaw || file.type.startsWith('image/')
     })
+    if (candidates.length === 0) return
     let importedCount = 0
     let completed = 0
-    setImportStatus(candidates.length > 1 ? `Importing 0 of ${candidates.length} photos...` : '')
+    setImportStatus('')
+    setImportProgress({ completed: 0, total: candidates.length, fileName: candidates[0].name })
     for (const file of candidates) {
+      setImportProgress({ completed, total: candidates.length, fileName: file.name })
       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
       const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       try {
@@ -119,10 +121,6 @@ function App() {
         let rawDetails: Omit<RawDecodeResponse, 'png'> | undefined
         if (isRaw) {
           rawBytes = new Uint8Array(await file.arrayBuffer())
-          // Pass the Uint8Array itself (not Array.from(rawBytes)) so Tauri
-          // sends it over the fast binary IPC path instead of JSON-encoding
-          // every byte as a separate array element — that conversion was
-          // the main cause of the import lag on larger RAW files.
           const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: rawBytes, profile: cameraProfile })
           rawDetails = decoded
           src = URL.createObjectURL(new Blob([base64ToBytes(decoded.png)], { type: 'image/png' }))
@@ -148,11 +146,11 @@ function App() {
         setImportError((current) => current ? `${current} | ${file.name}: ${String(error)}` : `${file.name}: ${String(error)}`)
       } finally {
         completed += 1
-        if (candidates.length > 1) setImportStatus(`Importing ${completed} of ${candidates.length} photos...`)
+        setImportProgress({ completed, total: candidates.length, fileName: file.name })
         await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
       }
     }
-    setImportStatus('')
+    setImportProgress(null)
     if (importedCount === 0) return
     setView('library')
   }
@@ -252,7 +250,7 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand-mark"><Aperture size={20} strokeWidth={2.4} /><span>sharply</span><small>PHOTO EDITOR</small></div>
-        <button className="import-button" disabled={Boolean(importStatus)} onClick={() => fileInputRef.current?.click()}><ImagePlus size={16} /> {importStatus ? 'Importing...' : 'Import photos'} <span>+</span></button>
+        <button className="import-button" disabled={Boolean(importStatus) || Boolean(importProgress)} onClick={() => fileInputRef.current?.click()}><ImagePlus size={16} /> {importStatus || importProgress ? 'Importing...' : 'Import photos'} <span>+</span></button>
         <input ref={fileInputRef} className="file-input" type="file" accept="image/*,.raw,.dng,.cr2,.nef,.arw" multiple onChange={handleFileChange} />
 
         <nav className="primary-nav" aria-label="Primary navigation">
@@ -287,7 +285,7 @@ function App() {
         {searchOpen && <div className="search-popover"><Search size={15} /><input autoFocus placeholder="Search imported photos" onChange={(event) => { const query = event.target.value.toLowerCase(); if (query) setActivePhoto(Math.max(0, photos.findIndex((photo) => photo.fileName.toLowerCase().includes(query)))) }} /></div>}
 
         <div className="content-area">
-          {importStatus && <div className="import-progress" role="status">{importStatus}</div>}
+          {importProgress ? <div className="import-progress" role="status" aria-live="polite"><div className="import-progress-heading"><span>Importing {importProgress.completed} of {importProgress.total}</span><strong>{Math.round((importProgress.completed / importProgress.total) * 100)}%</strong></div><span className="import-progress-file">{importProgress.fileName}</span><div className="import-progress-track" role="progressbar" aria-label="Import progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round((importProgress.completed / importProgress.total) * 100)}><span style={{ width: `${(importProgress.completed / importProgress.total) * 100}%` }} /></div></div> : importStatus && <div className="import-progress" role="status">{importStatus}</div>}
           {importError && <div className="import-error" role="alert">Could not import RAW file. {importError}</div>}
           <div className="content-header">
             <div><p className="eyebrow">Library / {photos.length} {photos.length === 1 ? 'photo' : 'photos'}</p><h1>Recent imports</h1></div>
