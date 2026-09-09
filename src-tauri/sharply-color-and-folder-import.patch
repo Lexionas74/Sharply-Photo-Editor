@@ -1,0 +1,510 @@
+From 0d9b1e8aed99fc665b54cf2b94ec5b8a4c259041 Mon Sep 17 00:00:00 2001
+From: Sharply Contributor <sharply-dev@example.com>
+Date: Tue, 8 Sep 2026 07:32:39 +0000
+Subject: [PATCH 1/2] Use real per-camera calibration matrices for RAW color
+
+decode_raw was calling raw.cam_to_xyz_normalized(), which relies on
+RawImage::xyz_to_cam - a field rawler never actually populates for any
+camera. Every RAW was silently falling back to naive as-shot sensor
+RGB with no real camera color science applied.
+
+rawler does ship genuine per-camera-model calibration data (the same
+database Adobe's DNG Converter uses) in RawImage::color_matrix, keyed
+by calibration illuminant - typically one tungsten ('A') and one
+daylight ('D65') matrix per camera. This switches to that data:
+
+- Selects and, when a camera has two calibration illuminants, blends
+  them in mired space based on this shot's own as-shot white balance
+  (the same approach DNG-based converters use), instead of one fixed
+  transform.
+- Estimates scene color temperature via McCamy's formula, with a
+  short fixed-point refinement.
+- Falls back to as-shot sensor RGB only when a camera truly has no
+  calibration entry at all.
+- Surfaces calibration status/estimated Kelvin in the returned
+  profile string.
+- Expands per-make look presets (saturation/contrast) beyond
+  Canon/Nikon/Sony to Fuji, Olympus/OM, Panasonic, Pentax, Leica,
+  Kodak, Samsung, Apple and medium-format bodies.
+
+Verified the matrix math (inversion, mired blending, CCT estimation)
+against a standalone harness; the real crate needs a newer Rust
+toolchain than was available to compile end-to-end here.
+---
+ src-tauri/src/lib.rs | 213 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 178 insertions(+), 35 deletions(-)
+
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 6878e66..719cd6f 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1,5 +1,12 @@
+ use image::{codecs::png::PngEncoder, imageops::FilterType, ColorType, ImageEncoder};
+-use rawler::{decoders::RawDecodeParams, rawimage::RawImageData, rawsource::RawSource};
++use rawler::{
++  decoders::RawDecodeParams,
++  imgop::matrix::{multiply_row1, pseudo_inverse, transform_1d},
++  imgop::xyz::Illuminant,
++  rawimage::RawImageData,
++  rawsource::RawSource,
++  RawImage,
++};
+ use serde::Serialize;
+ 
+ const PREVIEW_EDGE: usize = 2400;
+@@ -52,17 +59,154 @@ struct CameraProfile {
+ fn camera_profile(requested: Option<&str>, camera_make: &str) -> CameraProfile {
+   let requested = requested.unwrap_or("auto").to_ascii_lowercase();
+   let make = if requested == "auto" { camera_make.to_ascii_lowercase() } else { requested };
++  // These per-make saturation/contrast multipliers are a stylistic "look"
++  // layered on top of the calibrated colour transform below (matching how
++  // Lightroom's manufacturer-branded Camera Color profiles are also a look
++  // applied per make, not per exact body). The actual per-camera accuracy —
++  // what varies model to model — comes from `camera_to_xyz_matrix`, which
++  // uses each camera's own calibrated matrices rather than this table.
+   if make.contains("canon") {
+     CameraProfile { name: "Canon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.12, contrast: 1.12 }
+   } else if make.contains("nikon") {
+     CameraProfile { name: "Nikon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.06, contrast: 1.05 }
+   } else if make.contains("sony") {
+     CameraProfile { name: "Sony Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.09, contrast: 1.08 }
++  } else if make.contains("fuji") {
++    CameraProfile { name: "Fujifilm Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.14, contrast: 1.1 }
++  } else if make.contains("olympus") || make.contains("om digital") || make.contains("om system") {
++    CameraProfile { name: "OM/Olympus Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.08, contrast: 1.06 }
++  } else if make.contains("panasonic") || make.contains("lumix") {
++    CameraProfile { name: "Panasonic Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.05, contrast: 1.04 }
++  } else if make.contains("pentax") || make.contains("ricoh") {
++    CameraProfile { name: "Pentax Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.07, contrast: 1.05 }
++  } else if make.contains("leica") {
++    CameraProfile { name: "Leica Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.03, contrast: 1.02 }
++  } else if make.contains("kodak") {
++    CameraProfile { name: "Kodak Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.1, contrast: 1.08 }
++  } else if make.contains("samsung") {
++    CameraProfile { name: "Samsung Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.06, contrast: 1.05 }
++  } else if make.contains("apple") {
++    CameraProfile { name: "Apple Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.04, contrast: 1.03 }
++  } else if make.contains("hasselblad") || make.contains("phase one") || make.contains("leaf") || make.contains("mamiya") {
++    CameraProfile { name: "Medium Format Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.0, contrast: 1.0 }
+   } else {
+     CameraProfile { name: "Camera Embedded", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 }
+   }
+ }
+ 
++/// Approximate correlated colour temperature (Kelvin) for the illuminants
++/// rawler's camera database uses when it stores a camera's calibration
++/// matrices (mirrors the constants the DNG spec assigns to these same
++/// standard illuminant identifiers).
++fn illuminant_kelvin(illuminant: Illuminant) -> f32 {
++  match illuminant {
++    Illuminant::Tungsten | Illuminant::A | Illuminant::IsoStudioTungsten => 2850.0,
++    Illuminant::CoolWhiteFluorescent | Illuminant::WhiteFluorescent | Illuminant::Fluorescent => 4000.0,
++    Illuminant::DaylightFluorescent | Illuminant::DaylightWhiteFluorescent => 5000.0,
++    Illuminant::B => 4874.0,
++    Illuminant::D50 => 5003.0,
++    Illuminant::D55 | Illuminant::Flash => 5503.0,
++    Illuminant::C => 6774.0,
++    Illuminant::D65 | Illuminant::Daylight | Illuminant::FineWeather => 6504.0,
++    Illuminant::D75 | Illuminant::CloudyWeather | Illuminant::Shade => 7504.0,
++    Illuminant::Unknown => 6504.0,
++  }
++}
++
++/// McCamy's closed-form approximation of correlated colour temperature from
++/// CIE XYZ. Accurate to a few Kelvin across the 2000-10000K range typical of
++/// camera white balance, without needing an iterative Planckian-locus search.
++fn cct_from_xyz(xyz: [f32; 3]) -> f32 {
++  let sum = xyz[0] + xyz[1] + xyz[2];
++  if !(sum > 1e-6) {
++    return 6504.0;
++  }
++  let x = xyz[0] / sum;
++  let y = xyz[1] / sum;
++  let denominator = 0.1858 - y;
++  if denominator.abs() < 1e-6 {
++    return 6504.0;
++  }
++  let n = (x - 0.3320) / denominator;
++  (437.0 * n.powi(3) + 3601.0 * n.powi(2) + 6861.0 * n + 5517.0).clamp(2000.0, 25000.0)
++}
++
++/// Blends two calibration matrices the way DNG/Adobe raw converters do:
++/// linearly in "mired" (reciprocal megakelvin) space, weighted by how close
++/// the scene's estimated colour temperature is to each calibration
++/// illuminant. This is what lets one camera's *pair* of matrices track
++/// colour correctly across different lighting, instead of a single fixed
++/// matrix that is only truly correct under one illuminant.
++fn blend_matrices(low: [[f32; 3]; 3], low_k: f32, high: [[f32; 3]; 3], high_k: f32, cct: f32) -> [[f32; 3]; 3] {
++  if (high_k - low_k).abs() < 1.0 {
++    return low;
++  }
++  let mired_low = 1_000_000.0 / low_k;
++  let mired_high = 1_000_000.0 / high_k;
++  let mired_scene = 1_000_000.0 / cct.clamp(low_k.min(high_k), low_k.max(high_k));
++  let weight_low = ((mired_scene - mired_high) / (mired_low - mired_high)).clamp(0.0, 1.0);
++  let mut out = [[0.0_f32; 3]; 3];
++  for row in 0..3 {
++    for col in 0..3 {
++      out[row][col] = weight_low * low[row][col] + (1.0 - weight_low) * high[row][col];
++    }
++  }
++  out
++}
++
++/// Selects (and, where the camera provides more than one calibration
++/// illuminant, blends) the camera's *own* colour matrices — the real
++/// per-camera-model calibration data rawler ships for hundreds of bodies —
++/// instead of a single generic transform. This is what actually makes the
++/// colour render "per camera": each model has its own matrix pair, and the
++/// blend below is solved for this shot's own as-shot white balance rather
++/// than assuming one fixed illuminant. Returns the resulting camera->XYZ(D50)
++/// matrix together with the estimated scene colour temperature, or `None`
++/// when this camera model has no calibration data in the database at all.
++fn camera_to_xyz_matrix(raw: &RawImage, white_balance: [f32; 4]) -> Option<([[f32; 3]; 3], f32)> {
++  let mut matrices: Vec<(Illuminant, [[f32; 3]; 3])> = raw
++    .color_matrix
++    .iter()
++    .filter_map(|(illuminant, flat)| transform_1d::<3, 3>(flat).map(|matrix| (*illuminant, matrix)))
++    .collect();
++  if matrices.is_empty() {
++    return None;
++  }
++  matrices.sort_by(|a, b| illuminant_kelvin(a.0).partial_cmp(&illuminant_kelvin(b.0)).unwrap_or(std::cmp::Ordering::Equal));
++  let (low_illuminant, low_matrix) = matrices[0];
++  let (high_illuminant, high_matrix) = *matrices.last().expect("checked non-empty above");
++
++  if matrices.len() == 1 || low_illuminant == high_illuminant {
++    let kelvin = illuminant_kelvin(low_illuminant);
++    return Some((pseudo_inverse::<3>(low_matrix), kelvin));
++  }
++
++  let low_k = illuminant_kelvin(low_illuminant);
++  let high_k = illuminant_kelvin(high_illuminant);
++  // A neutral (grey) subject's raw camera-space colour is the reciprocal of
++  // the as-shot white balance multipliers a neutral patch needs to look
++  // neutral. Running that through a candidate cam->XYZ matrix and estimating
++  // its colour temperature lets this pick the correct blend for *this*
++  // shot's actual lighting rather than a single "generic daylight" matrix.
++  let cam_neutral = [
++    if white_balance[0] > 0.0 { 1.0 / white_balance[0] } else { 1.0 },
++    1.0,
++    if white_balance[2] > 0.0 { 1.0 / white_balance[2] } else { 1.0 },
++  ];
++  let mut cct = (low_k + high_k) / 2.0;
++  let mut matrix = blend_matrices(low_matrix, low_k, high_matrix, high_k, cct);
++  // A few fixed-point iterations converge quickly: re-estimate CCT from the
++  // neutral point run through the current blend, then re-blend against that
++  // estimate (the same approach DNG-based converters use).
++  for _ in 0..3 {
++    let cam_to_xyz = pseudo_inverse::<3>(matrix);
++    let xyz = multiply_row1(&cam_to_xyz, &cam_neutral);
++    cct = cct_from_xyz(xyz);
++    matrix = blend_matrices(low_matrix, low_k, high_matrix, high_k, cct);
++  }
++  Some((pseudo_inverse::<3>(matrix), cct))
++}
++
+ fn linear_to_gamma(value: f32) -> f32 {
+   let value = value.max(0.0);
+   if value <= 0.003_130_8 { value * 12.92 } else { 1.055 * value.powf(1.0 / 2.4) - 0.055 }
+@@ -156,7 +300,12 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
+     1.0,
+   ];
+   let profile = camera_profile(profile.as_deref(), &raw.clean_make);
+-  let camera_to_xyz = raw.cam_to_xyz_normalized();
++  // Real per-camera-model calibration, blended for this shot's own white
++  // balance — see `camera_to_xyz_matrix` for why this replaces a single
++  // fixed transform. `None` only when the camera has no calibration data at
++  // all, in which case the loop below falls back to as-shot sensor RGB.
++  let calibration = camera_to_xyz_matrix(&raw, white_balance);
++  let cam_to_xyz = calibration.map(|(matrix, _)| matrix);
+   let mut linear_rgb = vec![[0.0_f32; 3]; output_width * output_height];
+   let mut linear_peak = 0.0_f32;
+ 
+@@ -185,43 +334,30 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
+           counts[plane] += 1;
+         }
+       }
+-      let mut camera_rgb = [0.0_f32; 4];
+-      // Bayer CFA uses R=0, G=1 and B=2.  The fourth component expected by
+-      // four-channel camera matrices is the second green sample, not CFA 3
+-      // (which denotes cyan in this decoder).  Feeding cyan/zero here was the
+-      // source of the magenta cast.
++      // Bayer CFA uses R=0, G=1 and B=2; average the two green samples.
++      let mut camera_rgb = [0.0_f32; 3];
+       for plane in 0..3 {
+         camera_rgb[plane] = if counts[plane] == 0 { 0.0 } else { sums[plane] / counts[plane] as f32 } * white_balance[plane];
+       }
+-      camera_rgb[3] = camera_rgb[1];
+ 
+-      let xyz = [
+-        camera_to_xyz[0][0] * camera_rgb[0] + camera_to_xyz[0][1] * camera_rgb[1] + camera_to_xyz[0][2] * camera_rgb[2] + camera_to_xyz[0][3] * camera_rgb[3],
+-        camera_to_xyz[1][0] * camera_rgb[0] + camera_to_xyz[1][1] * camera_rgb[1] + camera_to_xyz[1][2] * camera_rgb[2] + camera_to_xyz[1][3] * camera_rgb[3],
+-        camera_to_xyz[2][0] * camera_rgb[0] + camera_to_xyz[2][1] * camera_rgb[1] + camera_to_xyz[2][2] * camera_rgb[2] + camera_to_xyz[2][3] * camera_rgb[3],
+-      ];
+-      // rawler's camera-to-XYZ matrix follows the DNG ColorMatrix convention,
+-      // whose PCS is CIE XYZ referenced to a D50 white point (same convention
+-      // ICC profiles use) — not D65. The previous matrix here was the plain
+-      // XYZ(D65)->sRGB matrix, so every colour was going through an implicit,
+-      // un-adapted D50->D65 shift with no compensation: a Bradford-adapted
+-      // D50->sRGB matrix is needed instead, otherwise everything reads muted
+-      // and slightly off compared to a converter (like Lightroom) that
+-      // handles the white point correctly.
+-      let matrix_srgb = [
+-        3.1338561 * xyz[0] - 1.6168667 * xyz[1] - 0.4906146 * xyz[2],
+-        -0.9787684 * xyz[0] + 1.9161415 * xyz[1] + 0.0334540 * xyz[2],
+-        0.0719453 * xyz[0] - 0.2289914 * xyz[1] + 1.4052427 * xyz[2],
+-      ];
+-      // Some camera entries provide an incomplete colour matrix.  Do not let
+-      // that turn a usable RAW into a black preview: retain the as-shot,
+-      // white-balanced sensor RGB until a valid camera transform is available.
+-      let matrix_peak = matrix_srgb.iter().copied().fold(0.0_f32, f32::max);
+-      let matrix_sum = matrix_srgb.iter().copied().filter(|value| value.is_finite() && *value > 0.0).sum::<f32>();
+-      let srgb = if matrix_peak.is_finite() && matrix_peak > 0.02 && matrix_sum > 0.01 {
+-        matrix_srgb
++      let srgb = if let Some(cam_to_xyz) = cam_to_xyz {
++        let xyz = multiply_row1(&cam_to_xyz, &camera_rgb);
++        // rawler's camera-to-XYZ matrix follows the DNG ColorMatrix
++        // convention, whose PCS is CIE XYZ referenced to a D50 white point
++        // (same convention ICC profiles use) — not D65. A Bradford-adapted
++        // D50->sRGB matrix is needed here, otherwise everything reads muted
++        // and slightly off compared to a converter (like Lightroom) that
++        // handles the white point correctly.
++        [
++          3.1338561 * xyz[0] - 1.6168667 * xyz[1] - 0.4906146 * xyz[2],
++          -0.9787684 * xyz[0] + 1.9161415 * xyz[1] + 0.0334540 * xyz[2],
++          0.0719453 * xyz[0] - 0.2289914 * xyz[1] + 1.4052427 * xyz[2],
++        ]
+       } else {
+-        [camera_rgb[0], (camera_rgb[1] + camera_rgb[3]) * 0.5, camera_rgb[2]]
++        // This particular camera model has no calibration data in the
++        // database at all: fall back to the as-shot, white-balanced sensor
++        // RGB rather than leaving the preview black.
++        camera_rgb
+       };
+       let clean = [
+         (srgb[0] * profile.rgb_balance[0]).max(0.0),
+@@ -271,7 +407,14 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
+   PngEncoder::new(&mut png)
+     .write_image(&rgb, output_width as u32, output_height as u32, ColorType::Rgb8.into())
+     .map_err(|error| format!("RAW preview encoding failed: {error}"))?;
+-  Ok(RawDecodeResult { png: base64_encode(&png), camera_make: raw.clean_make, camera_model: raw.clean_model, profile: profile.name.to_string() })
++  // Surface whether this render used the camera's own calibrated matrix (and
++  // at what estimated colour temperature it was blended) so it's visible in
++  // the UI that colour is coming from real per-camera data, not a guess.
++  let profile_label = match calibration {
++    Some((_, kelvin)) => format!("{} · {}K calibrated", profile.name, kelvin.round() as i32),
++    None => format!("{} (uncalibrated)", profile.name),
++  };
++  Ok(RawDecodeResult { png: base64_encode(&png), camera_make: raw.clean_make, camera_model: raw.clean_model, profile: profile_label })
+ }
+ 
+ #[cfg_attr(mobile, tauri::mobile_entry_point)]
+-- 
+2.43.0
+
+
+From 8105fd81f1eb879883ce408a31f1bec7603a1ec4 Mon Sep 17 00:00:00 2001
+From: Sharply Contributor <sharply-dev@example.com>
+Date: Tue, 8 Sep 2026 07:32:45 +0000
+Subject: [PATCH 2/2] Allow dragging photos or whole folders in to import
+
+The library dropzone only ever read DataTransfer.files, which for a
+dropped folder is empty/unreadable - only loose files worked.
+
+Adds a recursive walk over the drop's FileSystemEntry list (via
+webkitGetAsEntry/readEntries) so a dropped folder, including nested
+subfolders, is expanded into its files before handing off to the
+existing import pipeline. Falls back to the plain file list on
+webviews without the entry API.
+
+Also adds a non-drag 'Import folder' button (webkitdirectory file
+input) as an equivalent folder-import path, and widens the RAW
+extension allow-list/file picker to match the manufacturers the
+backend now has color profiles for.
+---
+ src/App.tsx    | 103 +++++++++++++++++++++++++++++++++++++++++++++----
+ src/styles.css |   2 +-
+ 2 files changed, 97 insertions(+), 8 deletions(-)
+
+diff --git a/src/App.tsx b/src/App.tsx
+index f4435e0..918d209 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -41,9 +41,81 @@ type Photo = {
+   profile?: string
+ }
+ 
+-type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony'
++type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony' | 'fuji' | 'olympus' | 'panasonic' | 'pentax' | 'leica'
+ type RawDecodeResponse = { png: string; camera_make: string; camera_model: string; profile: string }
+ 
++// Raw extensions for every manufacturer the backend now has a colour profile
++// for (see `camera_profile` in src-tauri/src/lib.rs), plus DNG which several
++// makers (Adobe, Leica, Pentax, Apple ProRAW) use directly.
++const RAW_EXTENSIONS = [
++  'cr1', 'cr2', 'cr3', 'crw', // Canon
++  'nef', 'nrw', // Nikon
++  'arw', 'srf', 'sr2', // Sony
++  'raf', // Fujifilm
++  'orf', // Olympus / OM System
++  'rw2', // Panasonic
++  'pef', 'ptx', // Pentax
++  '3fr', // Hasselblad
++  'iiq', // Phase One
++  'mos', // Leaf
++  'mef', // Mamiya
++  'srw', // Samsung
++  'dng', // Adobe / Leica / Pentax / Apple ProRAW
++]
++const RAW_ACCEPT = RAW_EXTENSIONS.map((extension) => `.${extension}`).join(',')
++
++// Recursively walks a dropped `FileSystemEntry` (a single file, or a folder
++// that may itself contain nested folders) and resolves every file within it.
++// The browser-native `DataTransfer.files` list only ever contains the
++// top-level dropped items and, for a folder, an unreadable placeholder — this
++// is what actually makes dragging a folder onto the app work.
++function readEntry(entry: FileSystemEntry): Promise<File[]> {
++  return new Promise((resolve) => {
++    if (entry.isFile) {
++      (entry as FileSystemFileEntry).file((file) => resolve([file]), () => resolve([]))
++      return
++    }
++    if (!entry.isDirectory) {
++      resolve([])
++      return
++    }
++    const reader = (entry as FileSystemDirectoryEntry).createReader()
++    const children: FileSystemEntry[] = []
++    // `readEntries` only returns a batch at a time (commonly capped around
++    // 100 entries per call), so it has to be called repeatedly until it
++    // reports an empty batch before a folder's contents are fully known.
++    const readNextBatch = () => {
++      reader.readEntries(async (batch) => {
++        if (batch.length === 0) {
++          const nested = await Promise.all(children.map(readEntry))
++          resolve(nested.flat())
++          return
++        }
++        children.push(...batch)
++        readNextBatch()
++      }, () => resolve([]))
++    }
++    readNextBatch()
++  })
++}
++
++// Expands whatever was dropped — a mix of loose files and/or folders — into
++// a flat file list, falling back to the plain file list on browsers/webviews
++// that don't expose the entry API.
++async function filesFromDataTransfer(dataTransfer: DataTransfer): Promise<File[]> {
++  const items = dataTransfer.items
++  if (items && items.length > 0) {
++    const entries = Array.from(items)
++      .map((item) => item.webkitGetAsEntry?.())
++      .filter((entry): entry is FileSystemEntry => Boolean(entry))
++    if (entries.length > 0) {
++      const nested = await Promise.all(entries.map(readEntry))
++      return nested.flat()
++    }
++  }
++  return Array.from(dataTransfer.files)
++}
++
+ // Decodes the base64 PNG the Rust side now returns. Base64 (a single
+ // string) is far cheaper to send over Tauri's IPC bridge than the previous
+ // `Vec<u8>`, which serialized as a JSON array with one element per byte.
+@@ -95,6 +167,7 @@ function App() {
+   const [importStatus, setImportStatus] = useState('')
+   const [cameraProfile, setCameraProfile] = useState<CameraProfileKey>('auto')
+   const fileInputRef = useRef<HTMLInputElement>(null)
++  const folderInputRef = useRef<HTMLInputElement>(null)
+   const photoUrls = useRef<string[]>([])
+   const selectedPhoto = photos[activePhoto]
+ 
+@@ -104,7 +177,7 @@ function App() {
+     setImportError('')
+     const candidates = files.filter((file) => {
+       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+-      const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
++      const isRaw = RAW_EXTENSIONS.includes(extension)
+       return isRaw || file.type.startsWith('image/')
+     })
+     let importedCount = 0
+@@ -112,7 +185,7 @@ function App() {
+     setImportStatus(candidates.length > 1 ? `Importing 0 of ${candidates.length} photos...` : '')
+     for (const file of candidates) {
+       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+-      const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
++      const isRaw = RAW_EXTENSIONS.includes(extension)
+       try {
+         let src: string
+         let rawBytes: Uint8Array | undefined
+@@ -184,7 +257,10 @@ function App() {
+   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+     event.preventDefault()
+     setIsDragging(false)
+-    void importFiles(Array.from(event.dataTransfer.files))
++    // Grab the DataTransfer synchronously (before the async folder walk)
++    // since React may reuse/clear the underlying native event afterwards.
++    const dataTransfer = event.dataTransfer
++    void filesFromDataTransfer(dataTransfer).then(importFiles)
+   }
+ 
+   const previewFilter = `brightness(${100 + adjustments.exposure * 0.55 + adjustments.highlights * 0.1 + adjustments.shadows * 0.08 + adjustments.whites * 0.12 + adjustments.blacks * 0.06}%) contrast(${100 + adjustments.contrast * 0.5 + adjustments.clarity * 0.18 + adjustments.dehaze * 0.16 + adjustments.sharpening * 0.12 + adjustments.whites * 0.14 - adjustments.blacks * 0.12}%) saturate(${100 + adjustments.vibrance * 0.42 + adjustments.saturation * 0.7 + adjustments.texture * 0.12}%) sepia(${Math.abs(adjustments.temperature) * 0.0025}%) hue-rotate(${adjustments.temperature * 0.12 + adjustments.tint * 0.18}deg) blur(${Math.max(0, adjustments.noiseReduction) * 0.012}px)`
+@@ -243,7 +319,7 @@ function App() {
+           <div className={`develop-canvas crop-${crop}`}><img style={{ filter: showBefore ? 'none' : previewFilter, transform: `scale(${zoom}) rotate(${rotation}deg)` }} src={selectedPhoto.src} alt={selectedPhoto.title} /><div className="vignette-overlay" style={{ opacity: Math.max(0, adjustments.vignette) / 140 }} /><div className="canvas-badge">{showBefore ? 'Before' : 'Live preview'}</div></div>
+           <div className="filmstrip"><button className="film-import" onClick={() => fileInputRef.current?.click()}><ImagePlus size={18} /><span>Import</span></button>{photos.map((photo, index) => <button className={`film-thumb ${activePhoto === index ? 'active' : ''}`} key={`${photo.fileName}-film-${index}`} onClick={() => { setActivePhoto(index); setShowBefore(false) }}><img src={photo.src} alt={photo.title} /><span>{index + 1}</span></button>)}</div>
+         </section>
+-        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
++        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option><option value="fuji">Fujifilm Camera Color</option><option value="olympus">OM/Olympus Camera Color</option><option value="panasonic">Panasonic Camera Color</option><option value="pentax">Pentax Camera Color</option><option value="leica">Leica Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
+       </main>
+     )
+   }
+@@ -253,7 +329,20 @@ function App() {
+       <aside className="sidebar">
+         <div className="brand-mark"><Aperture size={20} strokeWidth={2.4} /><span>sharply</span><small>PHOTO EDITOR</small></div>
+         <button className="import-button" disabled={Boolean(importStatus)} onClick={() => fileInputRef.current?.click()}><ImagePlus size={16} /> {importStatus ? 'Importing...' : 'Import photos'} <span>+</span></button>
+-        <input ref={fileInputRef} className="file-input" type="file" accept="image/*,.raw,.dng,.cr2,.nef,.arw" multiple onChange={handleFileChange} />
++        <button className="import-button secondary" disabled={Boolean(importStatus)} onClick={() => folderInputRef.current?.click()}><Folder size={16} /> Import folder <span>+</span></button>
++        <input ref={fileInputRef} className="file-input" type="file" accept={`image/*,${RAW_ACCEPT}`} multiple onChange={handleFileChange} />
++        {/* `webkitdirectory` lets the native file dialog pick a whole folder
++            (recursively) as a non-drag alternative to the drag-and-drop
++            folder support below; it has no React/TS typing, hence the cast. */}
++        <input
++          ref={folderInputRef}
++          className="file-input"
++          type="file"
++          accept={`image/*,${RAW_ACCEPT}`}
++          multiple
++          onChange={handleFileChange}
++          {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
++        />
+ 
+         <nav className="primary-nav" aria-label="Primary navigation">
+           <button className="nav-item active" onClick={() => setView('library')}><Grid2X2 size={17} /> Library <span>{photos.length}</span></button>
+@@ -297,7 +386,7 @@ function App() {
+           <div className="toolbar"><div className="filter-group"><button className="filter active">All <span>{photos.length}</span></button><button className="filter">Unrated <span>{photos.length}</span></button><button className="filter">Flagged <span>0</span></button></div><div className="view-options"><button className="view-button active"><Grid2X2 size={16} /></button><button className="view-button"><LayoutPanelLeft size={16} /></button><span className="sort-label">Sort by <strong>Import date</strong><ChevronDown size={14} /></span></div></div>
+ 
+           <div className={`photo-grid ${isDragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true) }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
+-            {photos.length ? photos.map((photo, index) => <button className={`photo-card ${activePhoto === index ? 'selected' : ''}`} key={`${photo.fileName}-${index}`} onClick={() => setActivePhoto(index)}><img src={photo.src} alt={photo.title} /><span className="photo-badge">{photo.kind}</span><span className="photo-caption"><strong>{photo.title}</strong><small>{photo.location}</small></span></button>) : <div className="empty-library"><ImagePlus size={27} /><h2>Your library is empty</h2><p>Import photos from your computer to start editing.</p><button className="solid-button" onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Choose photos</button><span>or drag image files here</span></div>}
++            {photos.length ? photos.map((photo, index) => <button className={`photo-card ${activePhoto === index ? 'selected' : ''}`} key={`${photo.fileName}-${index}`} onClick={() => setActivePhoto(index)}><img src={photo.src} alt={photo.title} /><span className="photo-badge">{photo.kind}</span><span className="photo-caption"><strong>{photo.title}</strong><small>{photo.location}</small></span></button>) : <div className="empty-library"><ImagePlus size={27} /><h2>Your library is empty</h2><p>Import photos from your computer to start editing.</p><button className="solid-button" onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Choose photos</button><span>or drag photos or whole folders here</span></div>}
+           </div>
+         </div>
+       </section>
+diff --git a/src/styles.css b/src/styles.css
+index eeaa5a3..d262147 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -10,7 +10,7 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
+ .brand-mark svg { color: #d7c07b; }
+ .import-button, .solid-button { display: flex; justify-content: center; align-items: center; gap: 9px; background: #d8c37a; color: #1d211c; font-size: 12px; font-weight: 800; border-radius: 5px; padding: 11px 13px; }
+ .file-input { display: none; }.import-button:disabled, .solid-button:disabled, .outline-button:disabled { cursor: not-allowed; opacity: .4; }
+-.import-button { justify-content: flex-start; margin-bottom: 25px; }.import-button span { margin-left: auto; font-size: 18px; font-weight: 400; }
++.import-button { justify-content: flex-start; margin-bottom: 25px; }.import-button span { margin-left: auto; font-size: 18px; font-weight: 400; }.import-button.secondary { background: transparent; border: 1px solid #3d4840; color: #cfd6cc; margin-top: -15px; }.import-button.secondary:hover { border-color: #d8c37a; color: #f0eee4; }
+ .primary-nav, .sidebar-section { border-bottom: 1px solid #2a302d; padding-bottom: 17px; margin-bottom: 18px; }
+ .nav-item, .collection-item, .new-collection, .footer-button { width: 100%; display: flex; align-items: center; gap: 11px; padding: 9px 10px; text-align: left; background: transparent; color: #8f9993; border-radius: 4px; font-size: 12px; }
+ .nav-item:hover, .collection-item:hover, .new-collection:hover, .footer-button:hover { background: #222825; color: #e8ece5; }.nav-item.active { color: #f4f5ef; background: #252b27; font-weight: 700; }.nav-item span, .collection-item span { margin-left: auto; color: #68736c; font-family: 'DM Mono', monospace; font-size: 10px; }
+-- 
+2.43.0
+
