@@ -49,18 +49,66 @@ struct CameraProfile {
   contrast: f32,
 }
 
+// One tuned "look" per major camera brand, approximating (not scientifically
+// reproducing) each manufacturer's out-of-camera JPEG color science — the
+// same reference point Lightroom's own "Camera Matching" profiles target.
+// `rgb_balance` is a deliberately subtle (≤2%) per-channel nudge on top of
+// the as-shot white balance the camera already recorded; it's a stylistic
+// tilt, not a colorimetric correction, so it stays small to avoid casts.
+const BRAND_PROFILES: &[(&[&str], CameraProfile)] = &[
+  (
+    &["canon"],
+    // Known for warm, punchy skin tones and saturated reds.
+    CameraProfile { name: "Canon Camera Color", rgb_balance: [1.015, 1.0, 0.985], saturation: 1.12, contrast: 1.12 },
+  ),
+  (
+    &["nikon"],
+    // Neutral and accurate, with a bit more inherent contrast than warmth.
+    CameraProfile { name: "Nikon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.06, contrast: 1.10 },
+  ),
+  (
+    &["sony"],
+    // Clean and slightly cool/neutral rendering.
+    CameraProfile { name: "Sony Camera Color", rgb_balance: [0.995, 1.0, 1.01], saturation: 1.07, contrast: 1.06 },
+  ),
+  (
+    &["fujifilm", "fuji"],
+    // Fujifilm's film-simulation heritage: rich, high-saturation color.
+    CameraProfile { name: "Fujifilm Camera Color", rgb_balance: [1.005, 1.0, 0.995], saturation: 1.14, contrast: 1.10 },
+  ),
+  (
+    &["panasonic", "lumix"],
+    // Comparatively neutral and restrained out of camera.
+    CameraProfile { name: "Panasonic Camera Color", rgb_balance: [0.995, 1.0, 1.005], saturation: 1.03, contrast: 1.04 },
+  ),
+  (
+    &["olympus", "om digital", "om system"],
+    // Micro Four Thirds' vivid, punchy default rendering.
+    CameraProfile { name: "Olympus Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.13, contrast: 1.11 },
+  ),
+  (
+    &["pentax", "ricoh"],
+    // Warm, distinctive, slightly film-like "Pentax color".
+    CameraProfile { name: "Pentax Camera Color", rgb_balance: [1.01, 1.0, 0.99], saturation: 1.08, contrast: 1.05 },
+  ),
+  (
+    &["leica"],
+    // Leica's look is famously understated rather than punchy.
+    CameraProfile { name: "Leica Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 },
+  ),
+];
+
+const FALLBACK_PROFILE: CameraProfile =
+  CameraProfile { name: "Camera Embedded", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 };
+
 fn camera_profile(requested: Option<&str>, camera_make: &str) -> CameraProfile {
   let requested = requested.unwrap_or("auto").to_ascii_lowercase();
   let make = if requested == "auto" { camera_make.to_ascii_lowercase() } else { requested };
-  if make.contains("canon") {
-    CameraProfile { name: "Canon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.12, contrast: 1.12 }
-  } else if make.contains("nikon") {
-    CameraProfile { name: "Nikon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.06, contrast: 1.05 }
-  } else if make.contains("sony") {
-    CameraProfile { name: "Sony Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.09, contrast: 1.08 }
-  } else {
-    CameraProfile { name: "Camera Embedded", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 }
-  }
+  BRAND_PROFILES
+    .iter()
+    .find(|(keywords, _)| keywords.iter().any(|keyword| make.contains(keyword)))
+    .map(|(_, profile)| *profile)
+    .unwrap_or(FALLBACK_PROFILE)
 }
 
 fn linear_to_gamma(value: f32) -> f32 {
