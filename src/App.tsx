@@ -1,5 +1,6 @@
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { Adjustments, initialAdjustments, isNeutral, processImage } from './imageAdjustments'
 import {
   Aperture,
   ArrowLeft,
@@ -54,29 +55,62 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   return bytes
 }
 
-type Adjustments = {
-  exposure: number
-  contrast: number
-  highlights: number
-  shadows: number
-  whites: number
-  blacks: number
-  temperature: number
-  tint: number
-  texture: number
-  clarity: number
-  dehaze: number
-  vibrance: number
-  saturation: number
-  sharpening: number
-  noiseReduction: number
-  vignette: number
-}
+// Runs the real per-pixel Develop adjustments (see imageAdjustments.ts)
+// against the base decoded image and returns a data URL of the result, or
+// the original `src` unchanged when every slider is at its neutral value
+// (skipping the canvas round-trip entirely in the common case of only a
+// few sliders being touched). Recomputes are debounced to one per animation
+// frame, so a fast slider drag reprocesses at most once per frame using the
+// latest value rather than queuing up every intermediate one.
+function useProcessedImage(src: string | undefined, adjustments: Adjustments): string | undefined {
+  const [processedSrc, setProcessedSrc] = useState<string | undefined>(src)
+  const imageCache = useRef(new Map<string, HTMLImageElement>())
+  const frameRef = useRef<number | undefined>(undefined)
 
-const initialAdjustments: Adjustments = {
-  exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0,
-  temperature: 0, tint: 0, texture: 0, clarity: 0, dehaze: 0, vibrance: 0,
-  saturation: 0, sharpening: 0, noiseReduction: 0, vignette: 0,
+  useEffect(() => {
+    if (!src) {
+      setProcessedSrc(undefined)
+      return
+    }
+    if (isNeutral(adjustments)) {
+      setProcessedSrc(src)
+      return
+    }
+
+    let cancelled = false
+    if (frameRef.current !== undefined) cancelAnimationFrame(frameRef.current)
+    frameRef.current = requestAnimationFrame(() => {
+      void (async () => {
+        let image = imageCache.current.get(src)
+        if (!image) {
+          image = new Image()
+          image.src = src
+          await new Promise<void>((resolve, reject) => {
+            image!.onload = () => resolve()
+            image!.onerror = () => reject(new Error('Failed to load image for processing'))
+          })
+          imageCache.current.set(src, image)
+        }
+        if (cancelled) return
+        const canvas = document.createElement('canvas')
+        canvas.width = image.naturalWidth
+        canvas.height = image.naturalHeight
+        const context = canvas.getContext('2d')
+        if (!context) return
+        context.drawImage(image, 0, 0)
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height)
+        processImage({ data: imageData.data, width: canvas.width, height: canvas.height }, adjustments)
+        context.putImageData(imageData, 0, 0)
+        if (!cancelled) setProcessedSrc(canvas.toDataURL('image/png'))
+      })()
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [src, adjustments])
+
+  return processedSrc
 }
 
 function App() {
@@ -187,7 +221,7 @@ function App() {
     void importFiles(Array.from(event.dataTransfer.files))
   }
 
-  const previewFilter = `brightness(${100 + adjustments.exposure * 0.55 + adjustments.highlights * 0.1 + adjustments.shadows * 0.08 + adjustments.whites * 0.12 + adjustments.blacks * 0.06}%) contrast(${100 + adjustments.contrast * 0.5 + adjustments.clarity * 0.18 + adjustments.dehaze * 0.16 + adjustments.sharpening * 0.12 + adjustments.whites * 0.14 - adjustments.blacks * 0.12}%) saturate(${100 + adjustments.vibrance * 0.42 + adjustments.saturation * 0.7 + adjustments.texture * 0.12}%) sepia(${Math.abs(adjustments.temperature) * 0.0025}%) hue-rotate(${adjustments.temperature * 0.12 + adjustments.tint * 0.18}deg) blur(${Math.max(0, adjustments.noiseReduction) * 0.012}px)`
+  const processedSrc = useProcessedImage(selectedPhoto?.src, adjustments)
 
   const resetAdjustments = () => {
     setAdjustments(initialAdjustments)
@@ -219,10 +253,18 @@ function App() {
       canvas.height = image.naturalHeight
       const context = canvas.getContext('2d')
       if (!context) return
-      context.filter = previewFilter
+      // Rotation is a geometric transform, so it still happens at draw time;
+      // the actual tone/color adjustments now run on real pixels afterward
+      // (see imageAdjustments.ts) instead of relying on canvas's CSS-filter
+      // emulation, so the exported file matches the live preview exactly.
       context.translate(canvas.width / 2, canvas.height / 2)
       context.rotate((rotation * Math.PI) / 180)
       context.drawImage(image, -image.naturalWidth / 2, -image.naturalHeight / 2)
+      if (!isNeutral(adjustments)) {
+        const imageData = context.getImageData(0, 0, canvas.width, canvas.height)
+        processImage({ data: imageData.data, width: canvas.width, height: canvas.height }, adjustments)
+        context.putImageData(imageData, 0, 0)
+      }
       const link = document.createElement('a')
       link.download = `${selectedPhoto.title}-sharply.jpg`
       link.href = canvas.toDataURL('image/jpeg', 0.92)
@@ -240,7 +282,7 @@ function App() {
         </header>
         <section className="develop-stage">
           <div className="canvas-toolbar"><div className="canvas-context"><span className="eyebrow">Local import</span><span>{selectedPhoto.fileName}</span></div><div className="canvas-tools"><button className={showBefore ? 'tool-button active' : 'tool-button'} onClick={() => setShowBefore((current) => !current)}>Before</button><button className={zoom === 1 ? 'tool-button active' : 'tool-button'} onClick={() => setZoom(1)}>Fit</button><button className={zoom === 1.5 ? 'tool-button active' : 'tool-button'} onClick={() => setZoom(1.5)}>100%</button><button className="icon-button" onClick={() => setZoom((current) => Math.max(.7, current - .1))}><Minus size={15} /></button><span className="zoom-label">{Math.round(zoom * 100)}%</span><button className="icon-button" onClick={() => setZoom((current) => Math.min(2, current + .1))}><Plus size={15} /></button><button className="icon-button" onClick={() => setRotation((current) => current + 90)} title="Rotate 90 degrees"><RotateCw size={15} /></button><button className="icon-button" onClick={toggleFullscreen} title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen canvas'}><Maximize2 size={15} /></button></div></div>
-          <div className={`develop-canvas crop-${crop}`}><img style={{ filter: showBefore ? 'none' : previewFilter, transform: `scale(${zoom}) rotate(${rotation}deg)` }} src={selectedPhoto.src} alt={selectedPhoto.title} /><div className="vignette-overlay" style={{ opacity: Math.max(0, adjustments.vignette) / 140 }} /><div className="canvas-badge">{showBefore ? 'Before' : 'Live preview'}</div></div>
+          <div className={`develop-canvas crop-${crop}`}><img style={{ transform: `scale(${zoom}) rotate(${rotation}deg)` }} src={(showBefore ? selectedPhoto.src : processedSrc) ?? selectedPhoto.src} alt={selectedPhoto.title} /><div className="canvas-badge">{showBefore ? 'Before' : 'Live preview'}</div></div>
           <div className="filmstrip"><button className="film-import" onClick={() => fileInputRef.current?.click()}><ImagePlus size={18} /><span>Import</span></button>{photos.map((photo, index) => <button className={`film-thumb ${activePhoto === index ? 'active' : ''}`} key={`${photo.fileName}-film-${index}`} onClick={() => { setActivePhoto(index); setShowBefore(false) }}><img src={photo.src} alt={photo.title} /><span>{index + 1}</span></button>)}</div>
         </section>
         <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
@@ -304,7 +346,7 @@ function App() {
 
       <aside className={`inspector ${view === 'edit' ? 'editing' : ''} ${!selectedPhoto ? 'empty-inspector' : ''}`}>
         {selectedPhoto ? <><div className="inspector-head"><div><span className="eyebrow">Selected photo</span><h2>{selectedPhoto.title}</h2></div><button className="icon-button"><PanelRight size={17} /></button></div>
-        <div className="preview-frame"><img className="inspector-image" style={{ filter: previewFilter }} src={selectedPhoto.src} alt={selectedPhoto.title} />{view === 'edit' && <span className="preview-state">Live preview</span>}</div>
+        <div className="preview-frame"><img className="inspector-image" src={(view === 'edit' ? processedSrc : selectedPhoto.src) ?? selectedPhoto.src} alt={selectedPhoto.title} />{view === 'edit' && <span className="preview-state">Live preview</span>}</div>
         <button className="develop-button" onClick={() => setView(view === 'edit' ? 'library' : 'edit')}><SlidersHorizontal size={16} /> {view === 'edit' ? 'Back to Library' : 'Open in Develop'} <Command size={14} /><span>D</span></button>
         {view === 'edit' && <div className="adjustment-panel">
           <div className="adjustment-heading"><span>Basic adjustments</span><button onClick={resetAdjustments}>Reset</button></div>
