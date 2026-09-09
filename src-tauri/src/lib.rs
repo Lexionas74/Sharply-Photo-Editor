@@ -3,6 +3,13 @@ use rawler::{decoders::RawDecodeParams, rawimage::RawImageData, rawsource::RawSo
 use serde::Serialize;
 
 const PREVIEW_EDGE: usize = 2400;
+
+// Tauri's IPC serializes command return values as JSON, and serde has no
+// native binary type — a `Vec<u8>` field serializes as a JSON array of
+// numbers, one array element per byte. For a multi-megabyte PNG preview that
+// is a very large, slow payload. Base64-encoding it into a single string is
+// dramatically smaller to transmit and parse; the frontend decodes it with
+// `atob`.
 const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -31,23 +38,77 @@ struct RawDecodeResult {
 #[derive(Clone, Copy)]
 struct CameraProfile {
   name: &'static str,
+  // The embedded camera matrix and as-shot white balance remain the primary
+  // source of colour calibration; these are the per-camera "look" applied on
+  // top, similar to Lightroom's Camera Color profiles (which are noticeably
+  // punchier than a flat linear render).
   rgb_balance: [f32; 3],
   saturation: f32,
+  // Multiplies the steepness of the base tone curve (see `tone_curve`) —
+  // this is not a flat linear contrast stretch.
   contrast: f32,
 }
+
+// One tuned "look" per major camera brand, approximating (not scientifically
+// reproducing) each manufacturer's out-of-camera JPEG color science — the
+// same reference point Lightroom's own "Camera Matching" profiles target.
+// `rgb_balance` is a deliberately subtle (≤2%) per-channel nudge on top of
+// the as-shot white balance the camera already recorded; it's a stylistic
+// tilt, not a colorimetric correction, so it stays small to avoid casts.
+const BRAND_PROFILES: &[(&[&str], CameraProfile)] = &[
+  (
+    &["canon"],
+    // Known for warm, punchy skin tones and saturated reds.
+    CameraProfile { name: "Canon Camera Color", rgb_balance: [1.015, 1.0, 0.985], saturation: 1.12, contrast: 1.12 },
+  ),
+  (
+    &["nikon"],
+    // Neutral and accurate, with a bit more inherent contrast than warmth.
+    CameraProfile { name: "Nikon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.06, contrast: 1.10 },
+  ),
+  (
+    &["sony"],
+    // Clean and slightly cool/neutral rendering.
+    CameraProfile { name: "Sony Camera Color", rgb_balance: [0.995, 1.0, 1.01], saturation: 1.07, contrast: 1.06 },
+  ),
+  (
+    &["fujifilm", "fuji"],
+    // Fujifilm's film-simulation heritage: rich, high-saturation color.
+    CameraProfile { name: "Fujifilm Camera Color", rgb_balance: [1.005, 1.0, 0.995], saturation: 1.14, contrast: 1.10 },
+  ),
+  (
+    &["panasonic", "lumix"],
+    // Comparatively neutral and restrained out of camera.
+    CameraProfile { name: "Panasonic Camera Color", rgb_balance: [0.995, 1.0, 1.005], saturation: 1.03, contrast: 1.04 },
+  ),
+  (
+    &["olympus", "om digital", "om system"],
+    // Micro Four Thirds' vivid, punchy default rendering.
+    CameraProfile { name: "Olympus Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.13, contrast: 1.11 },
+  ),
+  (
+    &["pentax", "ricoh"],
+    // Warm, distinctive, slightly film-like "Pentax color".
+    CameraProfile { name: "Pentax Camera Color", rgb_balance: [1.01, 1.0, 0.99], saturation: 1.08, contrast: 1.05 },
+  ),
+  (
+    &["leica"],
+    // Leica's look is famously understated rather than punchy.
+    CameraProfile { name: "Leica Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 },
+  ),
+];
+
+const FALLBACK_PROFILE: CameraProfile =
+  CameraProfile { name: "Camera Embedded", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.02, contrast: 1.0 };
 
 fn camera_profile(requested: Option<&str>, camera_make: &str) -> CameraProfile {
   let requested = requested.unwrap_or("auto").to_ascii_lowercase();
   let make = if requested == "auto" { camera_make.to_ascii_lowercase() } else { requested };
-  if make.contains("canon") {
-    CameraProfile { name: "Canon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 0.99, contrast: 1.00 }
-  } else if make.contains("nikon") {
-    CameraProfile { name: "Nikon Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 0.99, contrast: 1.00 }
-  } else if make.contains("sony") {
-    CameraProfile { name: "Sony Camera Color", rgb_balance: [1.0, 1.0, 1.0], saturation: 0.99, contrast: 1.00 }
-  } else {
-    CameraProfile { name: "Camera Embedded", rgb_balance: [1.0, 1.0, 1.0], saturation: 1.0, contrast: 1.0 }
-  }
+  BRAND_PROFILES
+    .iter()
+    .find(|(keywords, _)| keywords.iter().any(|keyword| make.contains(keyword)))
+    .map(|(_, profile)| *profile)
+    .unwrap_or(FALLBACK_PROFILE)
 }
 
 fn linear_to_gamma(value: f32) -> f32 {
@@ -67,34 +128,26 @@ fn tone_curve_params(steepness: f32) -> (f32, f32, f32) {
 
 #[inline]
 fn tone_curve(value: f32, k: f32, lo: f32, hi: f32) -> f32 {
+  // A gentle, symmetric S-curve applied in gamma-encoded (perceptual) space.
+  // This is what actually gives Lightroom's default render its contrast and
+  // deep blacks. The previous approach applied `(value - 0.5) * contrast` in
+  // *linear light*, where a correctly exposed midtone sits closer to 0.15-0.3,
+  // nowhere near the 0.5 pivot — so the contrast term was nearly inert and
+  // the image looked flat regardless of the `contrast` value. Working in
+  // gamma space keeps the curve's midpoint where midtones actually live.
+  //
+  // `k`, `lo` and `hi` only depend on the camera profile's steepness, not on
+  // the pixel — they're computed once per image by `tone_curve_params`
+  // rather than recomputed (with two extra `exp()` calls) for every pixel.
   if (hi - lo).abs() < 1e-5 {
     return value.clamp(0.0, 1.0);
   }
+  // Clamping the input to a little past [0, 1] rather than hard-clipping
+  // beforehand gives a soft shoulder into the highlights instead of a harsh
+  // cutoff, similar to the highlight rolloff a raw converter's tone curve
+  // provides.
   let sigmoid = |v: f32| 1.0 / (1.0 + (-k * (v - 0.5)).exp());
   ((sigmoid(value.clamp(-0.2, 1.2)) - lo) / (hi - lo)).clamp(0.0, 1.0)
-}
-
-fn canon_auto_tone(value: f32) -> f32 {
-  const STOPS: [(f32, f32); 7] = [
-    (0.00, 0.00),
-    (0.09, 0.067),
-    (0.188, 0.255),
-    (0.325, 0.478),
-    (0.451, 0.651),
-    (0.749, 0.906),
-    (1.00, 1.00),
-  ];
-  let value = value.clamp(0.0, 1.0);
-  for pair in STOPS.windows(2) {
-    let (x0, y0) = pair[0];
-    let (x1, y1) = pair[1];
-    if value <= x1 {
-      let t = ((value - x0) / (x1 - x0)).clamp(0.0, 1.0);
-      let smooth = t * t * (3.0 - 2.0 * t);
-      return y0 + (y1 - y0) * smooth;
-    }
-  }
-  1.0
 }
 
 fn decode_embedded_preview(source: &RawSource, requested_profile: Option<String>, decode_error: impl std::fmt::Display) -> Result<RawDecodeResult, String> {
@@ -119,56 +172,13 @@ fn decode_embedded_preview(source: &RawSource, requested_profile: Option<String>
   Ok(RawDecodeResult { png: base64_encode(&png), camera_make: camera_make.to_string(), camera_model: camera_model.to_string(), profile: format!("{} (embedded preview)", profile.name) })
 }
 
-fn develop_camera_raw(raw: &rawler::RawImage, requested_profile: Option<String>) -> Result<RawDecodeResult, String> {
-  let developed = rawler::imgop::develop::RawDevelop::default()
-    .develop_intermediate(raw)
-    .map_err(|error| format!("RAW development failed: {error}"))?;
-  let image = developed
-    .to_dynamic_image()
-    .ok_or_else(|| "RAW development produced no displayable image".to_string())?;
-  let scale = (PREVIEW_EDGE as f32 / image.width().max(image.height()) as f32).min(1.0);
-  let image = if scale < 1.0 {
-    image.resize((image.width() as f32 * scale).round() as u32, (image.height() as f32 * scale).round() as u32, FilterType::Triangle)
-  } else { image };
-  let profile = camera_profile(requested_profile.as_deref(), &raw.clean_make);
-  let (curve_k, curve_lo, curve_hi) = tone_curve_params(profile.contrast);
-  let mut rgb = image.to_rgb8();
-  for pixel in rgb.pixels_mut() {
-    let values = [pixel.0[0] as f32 / 255.0, pixel.0[1] as f32 / 255.0, pixel.0[2] as f32 / 255.0];
-    let luma = 0.2126 * values[0] + 0.7152 * values[1] + 0.0722 * values[2];
-    for channel in 0..3 {
-      let saturated = luma + (values[channel] * profile.rgb_balance[channel] - luma) * profile.saturation;
-      let curved = tone_curve(saturated, curve_k, curve_lo, curve_hi);
-      let rendered = if raw.clean_make.to_ascii_lowercase().contains("canon") {
-        canon_auto_tone(curved)
-      } else {
-        curved
-      };
-      pixel.0[channel] = to_u8(rendered);
-    }
-  }
-  let mut png = Vec::new();
-  PngEncoder::new(&mut png)
-    .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ColorType::Rgb8.into())
-    .map_err(|error| format!("RAW preview encoding failed: {error}"))?;
-  Ok(RawDecodeResult {
-    png: base64_encode(&png),
-    camera_make: raw.clean_make.clone(),
-    camera_model: raw.clean_model.clone(),
-    profile: profile.name.to_string(),
-  })
-}
-
 #[tauri::command]
-#[allow(unreachable_code)]
 fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult, String> {
   let source = RawSource::new_from_slice(&bytes);
   let raw = match rawler::decode(&source, &RawDecodeParams::default()) {
     Ok(raw) => raw,
     Err(error) => return decode_embedded_preview(&source, profile, error),
   };
-
-  return develop_camera_raw(&raw, profile);
 
   if raw.cpp != 1 {
     return decode_embedded_preview(&source, profile, "this RAW layout is not a Bayer mosaic");
@@ -200,6 +210,8 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
 
   for output_y in 0..output_height {
     for output_x in 0..output_width {
+      // Sample at pixel centres.  A single 3x3 neighbourhood builds all four
+      // Bayer planes at once, rather than scanning the mosaic once per colour.
       let y = (((output_y as f32 + 0.5) / scale) - 0.5).round().clamp(0.0, (height - 1) as f32) as usize;
       let x = (((output_x as f32 + 0.5) / scale) - 0.5).round().clamp(0.0, (width - 1) as f32) as usize;
       let output = output_y * output_width + output_x;
@@ -222,6 +234,10 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
         }
       }
       let mut camera_rgb = [0.0_f32; 4];
+      // Bayer CFA uses R=0, G=1 and B=2.  The fourth component expected by
+      // four-channel camera matrices is the second green sample, not CFA 3
+      // (which denotes cyan in this decoder).  Feeding cyan/zero here was the
+      // source of the magenta cast.
       for plane in 0..3 {
         camera_rgb[plane] = if counts[plane] == 0 { 0.0 } else { sums[plane] / counts[plane] as f32 } * white_balance[plane];
       }
@@ -232,11 +248,22 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
         camera_to_xyz[1][0] * camera_rgb[0] + camera_to_xyz[1][1] * camera_rgb[1] + camera_to_xyz[1][2] * camera_rgb[2] + camera_to_xyz[1][3] * camera_rgb[3],
         camera_to_xyz[2][0] * camera_rgb[0] + camera_to_xyz[2][1] * camera_rgb[1] + camera_to_xyz[2][2] * camera_rgb[2] + camera_to_xyz[2][3] * camera_rgb[3],
       ];
+      // rawler's camera-to-XYZ matrix follows the DNG ColorMatrix convention,
+      // whose PCS is CIE XYZ referenced to a D50 white point (same convention
+      // ICC profiles use) — not D65. The previous matrix here was the plain
+      // XYZ(D65)->sRGB matrix, so every colour was going through an implicit,
+      // un-adapted D50->D65 shift with no compensation: a Bradford-adapted
+      // D50->sRGB matrix is needed instead, otherwise everything reads muted
+      // and slightly off compared to a converter (like Lightroom) that
+      // handles the white point correctly.
       let matrix_srgb = [
         3.1338561 * xyz[0] - 1.6168667 * xyz[1] - 0.4906146 * xyz[2],
         -0.9787684 * xyz[0] + 1.9161415 * xyz[1] + 0.0334540 * xyz[2],
         0.0719453 * xyz[0] - 0.2289914 * xyz[1] + 1.4052427 * xyz[2],
       ];
+      // Some camera entries provide an incomplete colour matrix.  Do not let
+      // that turn a usable RAW into a black preview: retain the as-shot,
+      // white-balanced sensor RGB until a valid camera transform is available.
       let matrix_peak = matrix_srgb.iter().copied().fold(0.0_f32, f32::max);
       let matrix_sum = matrix_srgb.iter().copied().filter(|value| value.is_finite() && *value > 0.0).sum::<f32>();
       let srgb = if matrix_peak.is_finite() && matrix_peak > 0.02 && matrix_sum > 0.01 {
@@ -253,6 +280,9 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
       linear_peak = linear_peak.max(clean[0].max(clean[1]).max(clean[2]));
     }
   }
+
+  // A percentile-derived exposure is stable across small clipped highlights,
+  // unlike the previous single-pixel peak normalisation.
   let mut histogram = [0_u32; 256];
   for pixel in &linear_rgb {
     let luminance = (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]).clamp(0.0, 2.0);
@@ -269,6 +299,9 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
   let (curve_k, curve_lo, curve_hi) = tone_curve_params(profile.contrast);
   let mut rgb = vec![0_u8; output_width * output_height * 3];
   for (index, pixel) in linear_rgb.into_iter().enumerate() {
+    // Move into gamma-encoded (perceptual) space *before* saturation and
+    // contrast, matching how a raw converter's base curve behaves — see
+    // `tone_curve` for why this is the fix for the flat/dull look.
     let gamma = [
       linear_to_gamma(pixel[0] * exposure_gain),
       linear_to_gamma(pixel[1] * exposure_gain),
@@ -278,12 +311,7 @@ fn decode_raw(bytes: Vec<u8>, profile: Option<String>) -> Result<RawDecodeResult
     for channel in 0..3 {
       let saturated = luma + (gamma[channel] - luma) * profile.saturation;
       let curved = tone_curve(saturated, curve_k, curve_lo, curve_hi);
-      let rendered = if raw.clean_make.to_ascii_lowercase().contains("canon") {
-        canon_auto_tone(curved)
-      } else {
-        curved
-      };
-      rgb[index * 3 + channel] = to_u8(rendered);
+      rgb[index * 3 + channel] = to_u8(curved);
     }
   }
 
@@ -315,6 +343,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
   use super::decode_raw;
+
+  // Only needed to verify `base64_encode`'s output in tests; the app never
+  // needs to decode base64 on the Rust side (the frontend does that).
   fn base64_decode(input: &str) -> Vec<u8> {
     fn val(c: u8) -> Option<u32> {
       match c {
@@ -348,6 +379,7 @@ mod tests {
       let encoded = super::base64_encode(sample);
       assert_eq!(base64_decode(&encoded), *sample, "roundtrip mismatch for {sample:?}");
     }
+    // RFC 4648 section 10 test vector, spelled out explicitly.
     assert_eq!(super::base64_encode(b"foobar"), "Zm9vYmFy");
   }
 
@@ -369,5 +401,4 @@ mod tests {
       assert!(rendered.pixels().any(|pixel| pixel.0.iter().any(|value| *value > 8)), "preview should not be black");
     }
   }
-
 }

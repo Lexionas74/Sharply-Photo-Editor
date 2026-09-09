@@ -41,10 +41,12 @@ type Photo = {
   profile?: string
 }
 
-type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony'
+type CameraProfileKey = 'auto' | 'canon' | 'nikon' | 'sony' | 'fujifilm' | 'panasonic' | 'olympus' | 'pentax' | 'leica'
 type RawDecodeResponse = { png: string; camera_make: string; camera_model: string; profile: string }
-type ImportProgress = { completed: number; total: number; fileName: string }
 
+// Decodes the base64 PNG the Rust side now returns. Base64 (a single
+// string) is far cheaper to send over Tauri's IPC bridge than the previous
+// `Vec<u8>`, which serialized as a JSON array with one element per byte.
 function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
@@ -91,7 +93,6 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [importError, setImportError] = useState('')
   const [importStatus, setImportStatus] = useState('')
-  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null)
   const [cameraProfile, setCameraProfile] = useState<CameraProfileKey>('auto')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoUrls = useRef<string[]>([])
@@ -106,13 +107,10 @@ function App() {
       const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       return isRaw || file.type.startsWith('image/')
     })
-    if (candidates.length === 0) return
     let importedCount = 0
     let completed = 0
-    setImportStatus('')
-    setImportProgress({ completed: 0, total: candidates.length, fileName: candidates[0].name })
+    setImportStatus(candidates.length > 1 ? `Importing 0 of ${candidates.length} photos...` : '')
     for (const file of candidates) {
-      setImportProgress({ completed, total: candidates.length, fileName: file.name })
       const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
       const isRaw = ['cr1', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'dng'].includes(extension)
       try {
@@ -121,6 +119,10 @@ function App() {
         let rawDetails: Omit<RawDecodeResponse, 'png'> | undefined
         if (isRaw) {
           rawBytes = new Uint8Array(await file.arrayBuffer())
+          // Pass the Uint8Array itself (not Array.from(rawBytes)) so Tauri
+          // sends it over the fast binary IPC path instead of JSON-encoding
+          // every byte as a separate array element — that conversion was
+          // the main cause of the import lag on larger RAW files.
           const decoded = await invoke<RawDecodeResponse>('decode_raw', { bytes: rawBytes, profile: cameraProfile })
           rawDetails = decoded
           src = URL.createObjectURL(new Blob([base64ToBytes(decoded.png)], { type: 'image/png' }))
@@ -146,11 +148,11 @@ function App() {
         setImportError((current) => current ? `${current} | ${file.name}: ${String(error)}` : `${file.name}: ${String(error)}`)
       } finally {
         completed += 1
-        setImportProgress({ completed, total: candidates.length, fileName: file.name })
+        if (candidates.length > 1) setImportStatus(`Importing ${completed} of ${candidates.length} photos...`)
         await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
       }
     }
-    setImportProgress(null)
+    setImportStatus('')
     if (importedCount === 0) return
     setView('library')
   }
@@ -241,7 +243,7 @@ function App() {
           <div className={`develop-canvas crop-${crop}`}><img style={{ filter: showBefore ? 'none' : previewFilter, transform: `scale(${zoom}) rotate(${rotation}deg)` }} src={selectedPhoto.src} alt={selectedPhoto.title} /><div className="vignette-overlay" style={{ opacity: Math.max(0, adjustments.vignette) / 140 }} /><div className="canvas-badge">{showBefore ? 'Before' : 'Live preview'}</div></div>
           <div className="filmstrip"><button className="film-import" onClick={() => fileInputRef.current?.click()}><ImagePlus size={18} /><span>Import</span></button>{photos.map((photo, index) => <button className={`film-thumb ${activePhoto === index ? 'active' : ''}`} key={`${photo.fileName}-film-${index}`} onClick={() => { setActivePhoto(index); setShowBefore(false) }}><img src={photo.src} alt={photo.title} /><span>{index + 1}</span></button>)}</div>
         </section>
-        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
+        <aside className="develop-panel"><div className="panel-heading"><div><span className="eyebrow">Develop</span><h1>Basic</h1></div><span className="raw-label">{selectedPhoto.kind}</span></div><div className="develop-section"><div className="section-heading"><span>Tone</span><button onClick={resetAdjustments}>Reset</button></div>{([['exposure', 'Exposure'], ['contrast', 'Contrast'], ['highlights', 'Highlights'], ['shadows', 'Shadows'], ['whites', 'Whites'], ['blacks', 'Blacks']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Color</span></div>{selectedPhoto.kind === 'RAW' && <label className="develop-adjustment profile-adjustment"><span>Camera profile</span><select value={cameraProfile} onChange={(event) => void changeCameraProfile(event.target.value as CameraProfileKey)}><option value="auto">Auto (camera)</option><option value="canon">Canon Camera Color</option><option value="nikon">Nikon Camera Color</option><option value="sony">Sony Camera Color</option><option value="fujifilm">Fujifilm Camera Color</option><option value="panasonic">Panasonic Camera Color</option><option value="olympus">Olympus Camera Color</option><option value="pentax">Pentax Camera Color</option><option value="leica">Leica Camera Color</option></select><output title={selectedPhoto.profile}>{selectedPhoto.profile?.replace(' Camera Color', '') ?? 'Embedded'}</output></label>}{([['temperature', 'Temperature'], ['tint', 'Tint'], ['vibrance', 'Vibrance'], ['saturation', 'Saturation']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Presence</span><Sparkles size={14} /></div>{([['texture', 'Texture'], ['clarity', 'Clarity'], ['dehaze', 'Dehaze']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="-100" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name] > 0 ? '+' : ''}{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Detail</span><ChevronDown size={14} /></div>{([['sharpening', 'Sharpening'], ['noiseReduction', 'Noise reduction']] as const).map(([name, label]) => <label className="develop-adjustment" key={name}><span>{label}</span><input type="range" min="0" max="100" value={adjustments[name]} onChange={(event) => updateAdjustment(name, Number(event.target.value))} /><output>{adjustments[name]}</output></label>)}</div><div className="develop-section"><div className="section-heading"><span>Effects</span></div><label className="develop-adjustment"><span>Vignette</span><input type="range" min="0" max="100" value={adjustments.vignette} onChange={(event) => updateAdjustment('vignette', Number(event.target.value))} /><output>{adjustments.vignette}</output></label></div><div className="develop-section crop-controls"><div className="section-heading"><span><Crop size={14} /> Crop & rotate</span></div><div className="crop-buttons">{([['original', 'Original'], ['square', '1:1'], ['portrait', '4:5'], ['wide', '16:9']] as const).map(([value, label]) => <button className={crop === value ? 'tool-button active' : 'tool-button'} key={value} onClick={() => setCrop(value)}>{label}</button>)}<button className="tool-button" onClick={() => setRotation((current) => current + 90)}><RotateCw size={13} /> Rotate</button></div></div><div className="develop-panel-footer"><span>Non-destructive preview</span><button onClick={() => setView('library')}>Return to Library</button></div></aside>
       </main>
     )
   }
@@ -250,7 +252,7 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand-mark"><Aperture size={20} strokeWidth={2.4} /><span>sharply</span><small>PHOTO EDITOR</small></div>
-        <button className="import-button" disabled={Boolean(importStatus) || Boolean(importProgress)} onClick={() => fileInputRef.current?.click()}><ImagePlus size={16} /> {importStatus || importProgress ? 'Importing...' : 'Import photos'} <span>+</span></button>
+        <button className="import-button" disabled={Boolean(importStatus)} onClick={() => fileInputRef.current?.click()}><ImagePlus size={16} /> {importStatus ? 'Importing...' : 'Import photos'} <span>+</span></button>
         <input ref={fileInputRef} className="file-input" type="file" accept="image/*,.raw,.dng,.cr2,.nef,.arw" multiple onChange={handleFileChange} />
 
         <nav className="primary-nav" aria-label="Primary navigation">
@@ -285,7 +287,7 @@ function App() {
         {searchOpen && <div className="search-popover"><Search size={15} /><input autoFocus placeholder="Search imported photos" onChange={(event) => { const query = event.target.value.toLowerCase(); if (query) setActivePhoto(Math.max(0, photos.findIndex((photo) => photo.fileName.toLowerCase().includes(query)))) }} /></div>}
 
         <div className="content-area">
-          {importProgress ? <div className="import-progress" role="status" aria-live="polite"><div className="import-progress-heading"><span>Importing {importProgress.completed} of {importProgress.total}</span><strong>{Math.round((importProgress.completed / importProgress.total) * 100)}%</strong></div><span className="import-progress-file">{importProgress.fileName}</span><div className="import-progress-track" role="progressbar" aria-label="Import progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round((importProgress.completed / importProgress.total) * 100)}><span style={{ width: `${(importProgress.completed / importProgress.total) * 100}%` }} /></div></div> : importStatus && <div className="import-progress" role="status">{importStatus}</div>}
+          {importStatus && <div className="import-progress" role="status">{importStatus}</div>}
           {importError && <div className="import-error" role="alert">Could not import RAW file. {importError}</div>}
           <div className="content-header">
             <div><p className="eyebrow">Library / {photos.length} {photos.length === 1 ? 'photo' : 'photos'}</p><h1>Recent imports</h1></div>
